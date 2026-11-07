@@ -1,0 +1,209 @@
+name: windows-arm64
+
+# Native Windows ARM64 (Snapdragon X / Windows on ARM) binaries, built with MSYS2's CLANGARM64
+# clang, ported from upstream Eglantine PR Djihads80/Eglantine#425. Dispatched by hand; it is not
+# part of the release matrix, which ships x86_64 Windows only.
+#
+# The build wants a Windows ARM64 runner: the CLANGARM64 environment's windeployqt6 and the Qt
+# tools it calls are ARM64 programs, so the packaging step cannot run on an x64 runner, and the
+# bundled FFmpeg configures itself from the host.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pgo:
+        description: Also build the PGO variant (clang plus eglantine.profdata)
+        type: boolean
+        default: true
+      runner:
+        description: Runner label
+        type: choice
+        default: windows-11-arm
+        options:
+          - windows-11-arm
+          - windows-2022
+      build_tag:
+        description: LICHII_BUILD_TAG to stamp into the binaries (build-N, or empty)
+        type: string
+        default: "build-116"
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 3000M
+  CCACHE_COMPILERCHECK: content
+
+concurrency:
+  group: windows-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.platform }} binary
+    # The PGO variant is a matrix row, so a manual run with pgo unticked builds the plain one.
+    if: ${{ ! matrix.pgo || inputs.pgo }}
+    runs-on: ${{ inputs.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-aarch64
+            msystem: CLANGARM64
+            pgo: false
+          - platform: windows-aarch64-pgo
+            msystem: CLANGARM64
+            pgo: true
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      # The package list is docs/Deps.md (MSYS2) plus what the bundled FFmpeg needs to compile,
+      # same as the MinGW job in release-binaries.yml. pacboy maps each name to the CLANGARM64
+      # environment's own prefix (mingw-w64-clang-aarch64-), which has no toolchain or
+      # vulkan-devel metapackage and no gcc: only clang is built for Windows ARM64.
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          cache: true
+          install: >-
+            git make autoconf libtool automake-wrapper patch jq pactoys ninja
+          pacboy: >-
+            clang:p lld:p cmake:p python-pip:p
+            qt6-base:p qt6-charts:p qt6-tools:p qt6-translations:p qt6-svg:p
+            openssl:p boost:p fmt:p lz4:p nlohmann-json:p zlib:p zstd:p libiconv:p
+            vulkan-headers:p vulkan-loader:p vulkan-memory-allocator:p
+            spirv-tools:p spirv-headers:p glslang:p
+            enet:p opus:p libusb:p unordered_dense:p jbigkit:p xz:p libdeflate:p bzip2:p
+            lerc:p graphite2:p libwebp:p libtiff:p brotli:p ccache:p
+
+      - name: Restore CPM downloads
+        id: cpm-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .cache/cpm
+          key: cpm-${{ matrix.platform }}-v1-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'CMakeModules/CPM*.cmake', 'externals/**/CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          restore-keys: |
+            cpm-${{ matrix.platform }}-v1-
+
+      - name: Restore compiler objects
+        id: compiler-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .ccache
+          key: objects-${{ matrix.platform }}-v1-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            objects-${{ matrix.platform }}-v1-${{ github.sha }}-
+            objects-${{ matrix.platform }}-v1-
+
+      # MinGW build: system Qt and libraries from MSYS2, clang plus the repo's PGO profile. The
+      # profile path is converted to its Windows form because clang runs with the MSYS mount
+      # underneath. On CLANGARM64 Opus's NEON intrinsics do not build for aarch64 MinGW, and some
+      # sources miss a transitive <cstdlib> (upstream PR Djihads80/Eglantine#425).
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          arch_flags=(-DOPUS_MAY_HAVE_NEON=OFF -DOPUS_DISABLE_INTRINSICS=ON)
+          cxx_extra=" -include cstdlib"
+          profile=""
+          if [ '${{ matrix.pgo }}' = 'true' ]; then
+            test -s eglantine.profdata
+            profile="-fprofile-use=$(cygpath -m "$PWD/eglantine.profdata") -Wno-backend-plugin \
+              -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+          fi
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DYUZU_TESTS=OFF \
+            -DYUZU_CMD=ON \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DYUZU_USE_BUNDLED_FFMPEG=ON \
+            -DVulkanHeaders_FORCE_BUNDLED=ON \
+            -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+            -DENABLE_UPDATE_CHECKER=ON \
+            -DLICHII_BUILD_TAG=${{ inputs.build_tag }} \
+            -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DUSE_CCACHE=ON \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld \
+            "${arch_flags[@]}" \
+            "-DCMAKE_C_FLAGS=$profile" \
+            "-DCMAKE_CXX_FLAGS=$profile$cxx_extra"
+
+      - name: Save CPM downloads
+        if: steps.cpm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: .cache/cpm
+          key: ${{ steps.cpm-cache.outputs.cache-primary-key }}
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          ccache --zero-stats
+          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          ccache --show-stats
+
+      - name: Save compiler objects
+        if: always() && steps.compiler-cache.outcome == 'success'
+        uses: actions/cache/save@v5
+        with:
+          path: .ccache
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      # A dynamic MinGW build is not portable on its own: windeployqt6 brings the Qt libraries and
+      # plugins, then every non-system DLL the binaries and those plugins pull in gets copied next
+      # to them (docs/Caveats.md#msys2). The artifact is the bin folder; the release zip is made
+      # from it, as in release-binaries.yml.
+      - name: Package
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export PATH="$MINGW_PREFIX/bin:$PATH"
+          cd build/release/bin
+          test -f lichii.exe
+          test -f eden-cli.exe
+          windeployqt=$(command -v windeployqt6 || command -v windeployqt)
+          echo "using $windeployqt"
+          "$windeployqt" --no-translations --no-compiler-runtime --no-opengl-sw \
+            --no-system-dxc-compiler --no-system-d3d-compiler lichii.exe
+          deps() {
+            objdump -p "$1" | awk '/DLL Name:/ {print $3}' | while read -r dll; do
+              [ -z "$dll" ] && continue
+              source=$(command -v "$dll" 2>/dev/null || true)
+              [ -z "$source" ] && continue
+              # The system DLLs ship with Windows, so they never need bundling.
+              case "$source" in
+                *System32* | *SysWOW64*) continue ;;
+              esac
+              if [ ! -f "$dll" ]; then
+                cp "$source" "$dll"
+                deps "$source"
+              fi
+            done
+          }
+          for exe in lichii.exe eden-cli.exe; do
+            deps "$exe"
+          done
+          find . -name '*.dll' | while read -r dll; do
+            deps "$dll"
+          done
+          ls -la
+          objdump -f lichii.exe | head -4
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: lichii-${{ matrix.platform }}-${{ github.sha }}
+          path: build/release/bin/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
