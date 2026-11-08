@@ -39,19 +39,12 @@ concurrency:
 jobs:
   build:
     name: ${{ matrix.platform }} binary
-    # The PGO variant is a matrix row, so a manual run with pgo unticked builds the plain one.
-    if: ${{ ! matrix.pgo || inputs.pgo }}
     runs-on: ${{ inputs.runner }}
     strategy:
       fail-fast: false
+      # The PGO row only joins the matrix when the input asks for it.
       matrix:
-        include:
-          - platform: windows-aarch64
-            msystem: CLANGARM64
-            pgo: false
-          - platform: windows-aarch64-pgo
-            msystem: CLANGARM64
-            pgo: true
+        include: ${{ fromJSON(inputs.pgo && '[{"platform":"windows-aarch64","msystem":"CLANGARM64","pgo":false},{"platform":"windows-aarch64-pgo","msystem":"CLANGARM64","pgo":true}]' || '[{"platform":"windows-aarch64","msystem":"CLANGARM64","pgo":false}]') }}
 
     steps:
       - name: Check out source
