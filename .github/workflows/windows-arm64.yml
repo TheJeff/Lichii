@@ -142,7 +142,9 @@ jobs:
         run: |
           set -euo pipefail
           ccache --zero-stats
-          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          # Same target set release-binaries.yml builds on Windows: the GUI's update dialog
+          # launches lichii-updater.exe from next to itself.
+          cmake --build build/release --target yuzu yuzu-cmd lichii-updater --parallel
           ccache --show-stats
 
       - name: Save compiler objects
@@ -164,6 +166,7 @@ jobs:
           cd build/release/bin
           test -f lichii.exe
           test -f eden-cli.exe
+          test -f lichii-updater.exe
           windeployqt=$(command -v windeployqt6 || command -v windeployqt)
           echo "using $windeployqt"
           "$windeployqt" --no-translations --no-compiler-runtime --no-opengl-sw \
